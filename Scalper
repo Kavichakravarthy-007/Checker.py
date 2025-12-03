@@ -1,0 +1,103 @@
+# checker.py
+# Simple market-checker that sends a Telegram alert when EMA20>EMA50 + volume spike occurs.
+# Requirements: requests, pandas, numpy
+# Usage: run periodically (every 1-5 minutes). Example: `python checker.py BTCUSDT 1m`
+
+import os
+import sys
+import time
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ---------- CONFIG ----------
+TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")     # set in Render / env
+TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID")       # your chat id
+PAIR = sys.argv[1] if len(sys.argv) > 1 else "SOLUSDT"
+INTERVAL = sys.argv[2] if len(sys.argv) > 2 else "1m"  # e.g., 1m,5m,1h,4h
+CANDLE_LIMIT = 200
+VOLUME_MULT = 1.5   # volume spike multiplier
+EMA_FAST = 20
+EMA_SLOW = 50
+# ----------------------------
+
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+def fetch_klines(symbol, interval, limit=200):
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(BINANCE_KLINES, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    cols = ["open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_base","taker_quote","ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
+    return df
+
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+def check_conditions(df):
+    # compute EMAs
+    df["ema_fast"] = ema(df["close"], EMA_FAST)
+    df["ema_slow"] = ema(df["close"], EMA_SLOW)
+    # volume spike: compare last volume to mean of last N (exclude last)
+    vol_mean = df["volume"].iloc[-6:-1].mean() if len(df) >= 7 else df["volume"].mean()
+    last_vol = df["volume"].iloc[-1]
+    # price retest simple check: last close within 0.5% of EMA zone
+    last_close = df["close"].iloc[-1]
+    ema_zone = (df["ema_fast"].iloc[-1] + df["ema_slow"].iloc[-1]) / 2.0
+    retest = abs(last_close - ema_zone) / ema_zone < 0.006  # 0.6% retest window
+
+    cond_trend = df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]
+    cond_vol = last_vol > (VOLUME_MULT * vol_mean if vol_mean>0 else (VOLUME_MULT * df["volume"].mean()))
+    # make final decision conservative: require trend + (volume spike AND retest)
+    decision = cond_trend and cond_vol and retest
+    info = {
+        "cond_trend": bool(cond_trend),
+        "cond_vol": float(last_vol),
+        "vol_mean": float(vol_mean),
+        "retest": bool(retest),
+        "ema_fast": float(df["ema_fast"].iloc[-1]),
+        "ema_slow": float(df["ema_slow"].iloc[-1]),
+        "last_close": float(last_close)
+    }
+    return decision, info
+
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured. Skipping send.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print("Failed to send Telegram:", e)
+        return False
+
+def main():
+    try:
+        df = fetch_klines(PAIR, INTERVAL, CANDLE_LIMIT)
+    except Exception as e:
+        print("Kline fetch failed:", e)
+        return
+    decision, info = check_conditions(df)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    if decision:
+        text = (f"✅ Checklist met for <b>{PAIR}</b> ({INTERVAL})\n"
+                f"Price: {info['last_close']:.6f}\n"
+                f"EMA{EMA_FAST}: {info['ema_fast']:.6f} | EMA{EMA_SLOW}: {info['ema_slow']:.6f}\n"
+                f"Volume: {info['cond_vol']:.2f} (avg {info['vol_mean']:.2f})\n"
+                f"Time: {now}\n\nAction: Manual review & trade.")
+        ok = send_telegram(text)
+        print("Alert sent:", ok)
+    else:
+        print(f"No signal. Info: {info}")
+
+if __name__ == "__main__":
+    main()

@@ -1,60 +1,135 @@
-# checker.py
-# Simple market-checker that sends a Telegram alert when EMA20>EMA50 + volume spike occurs.
+# checker_enhanced.py
+# Enhanced checklist: pair whitelist, spread & 24h volume filter, orderbook/trade-sweep detector,
+# confidence score: trend(1) + volume(1) + orderbook_sweep(1)  => alert if score >= 2
 # Requirements: requests, pandas, numpy
-# Usage: run periodically (every 1-5 minutes). Example: `python checker.py BTCUSDT 1m`
 
-import os
-import sys
-import time
-import requests
+import os, sys, time, requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
 
 # ---------- CONFIG ----------
-TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")     # set in Render / env
-TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID")       # your chat id
+TELEGRAM_BOT_TOKEN = 8528031555:AAGQsildy_6e9GYHPPrpV_vaEPb2yiTDsSA
+TELEGRAM_CHAT_ID   = 1053740839
 PAIR = sys.argv[1] if len(sys.argv) > 1 else "SOLUSDT"
-INTERVAL = sys.argv[2] if len(sys.argv) > 2 else "1m"  # e.g., 1m,5m,1h,4h
-CANDLE_LIMIT = 200
-VOLUME_MULT = 1.5   # volume spike multiplier
+INTERVAL = sys.argv[2] if len(sys.argv) > 2 else "1m"
+CANDLE_LIMIT = 300
+VOLUME_MULT = 1.6    # stronger volume multiplier to reduce false positives
 EMA_FAST = 20
 EMA_SLOW = 50
+
+# Liquid pairs whitelist (modify as you like)
+PAIR_WHITELIST = {"BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","ADAUSDT"}
+
+# Minimum 24h base asset volume (in quote currency) — adjust to your risk profile
+MIN_24H_QUOTE_VOLUME = 1_000_000  # $1M
+
+# Max acceptable spread as fraction of mid price (e.g., 0.001 = 0.1%)
+MAX_SPREAD = 0.0015
+
+# Orderbook sweep detection params
+RECENT_TRADES_COUNT = 40
+SWEEP_BUY_THRESHOLD = 0.35  # if >35% of recent trade volume is taker buys (aggressive buys)
+LARGE_TRADE_MULT = 4.0      # detect single trade > 4x average trade size as sweep signal
+
+# Binance endpoints
+BASE = "https://api.binance.com"
+KLINES = f"{BASE}/api/v3/klines"
+TICKER_24 = f"{BASE}/api/v3/ticker/24hr"
+DEPTH = f"{BASE}/api/v3/depth"
+TRADES = f"{BASE}/api/v3/trades"
 # ----------------------------
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-
-def fetch_klines(symbol, interval, limit=200):
+def fetch_klines(symbol, interval, limit=CANDLE_LIMIT):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_KLINES, params=params, timeout=10)
-    r.raise_for_status()
+    r = requests.get(KLINES, params=params, timeout=10); r.raise_for_status()
     data = r.json()
     cols = ["open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_base","taker_quote","ignore"]
     df = pd.DataFrame(data, columns=cols)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
     df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
     return df
+
+def fetch_24h(symbol):
+    params = {"symbol": symbol}
+    r = requests.get(TICKER_24, params=params, timeout=8); r.raise_for_status()
+    return r.json()
+
+def fetch_orderbook(symbol, limit=50):
+    params = {"symbol": symbol, "limit": limit}
+    r = requests.get(DEPTH, params=params, timeout=8); r.raise_for_status()
+    return r.json()
+
+def fetch_recent_trades(symbol, limit=RECENT_TRADES_COUNT):
+    params = {"symbol": symbol, "limit": limit}
+    r = requests.get(TRADES, params=params, timeout=8); r.raise_for_status()
+    return r.json()
 
 def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
-def check_conditions(df):
-    # compute EMAs
+def spread_ok(symbol):
+    ob = fetch_orderbook(symbol, limit=5)
+    try:
+        best_bid = float(ob["bids"][0][0])
+        best_ask = float(ob["asks"][0][0])
+    except Exception:
+        return False, None
+    mid = (best_bid + best_ask) / 2.0
+    spread = (best_ask - best_bid) / mid
+    return (spread <= MAX_SPREAD), {"spread": spread, "bid": best_bid, "ask": best_ask, "mid": mid}
+
+def liquidity_ok(symbol):
+    t = fetch_24h(symbol)
+    # quoteVolume is quote asset volume (e.g., USDT)
+    quote_vol = float(t.get("quoteVolume", 0))
+    return (quote_vol >= MIN_24H_QUOTE_VOLUME), {"quoteVolume": quote_vol, "symbol": symbol}
+
+def detect_orderbook_sweep(symbol):
+    # heuristic: check recent trades for takerBuyBaseAssetVolume dominance and large single trades
+    trades = fetch_recent_trades(symbol, limit=RECENT_TRADES_COUNT)
+    if not trades:
+        return False, {"reason":"no_trades"}
+    sizes = [float(t["qty"]) for t in trades]
+    sides = [("buy" if t["isBuyerMaker"]==False else "sell") for t in trades]  # isBuyerMaker False => takerBuy
+    total_vol = sum(sizes)
+    buy_vol = sum(s for s,side in zip(sizes,sides) if side=="buy")
+    buy_ratio = buy_vol / total_vol if total_vol>0 else 0.0
+    avg_trade = np.mean(sizes)
+    large_trade_exists = any(s > (LARGE_TRADE_MULT * avg_trade) for s in sizes)
+    sweep = (buy_ratio >= SWEEP_BUY_THRESHOLD) or large_trade_exists
+    info = {"buy_ratio": buy_ratio, "total_vol": total_vol, "avg_trade": avg_trade, "large_trade": large_trade_exists}
+    return sweep, info
+
+def check_conditions(df, symbol):
     df["ema_fast"] = ema(df["close"], EMA_FAST)
     df["ema_slow"] = ema(df["close"], EMA_SLOW)
-    # volume spike: compare last volume to mean of last N (exclude last)
-    vol_mean = df["volume"].iloc[-6:-1].mean() if len(df) >= 7 else df["volume"].mean()
-    last_vol = df["volume"].iloc[-1]
-    # price retest simple check: last close within 0.5% of EMA zone
     last_close = df["close"].iloc[-1]
     ema_zone = (df["ema_fast"].iloc[-1] + df["ema_slow"].iloc[-1]) / 2.0
-    retest = abs(last_close - ema_zone) / ema_zone < 0.006  # 0.6% retest window
 
+    # Trend
     cond_trend = df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]
-    cond_vol = last_vol > (VOLUME_MULT * vol_mean if vol_mean>0 else (VOLUME_MULT * df["volume"].mean()))
-    # make final decision conservative: require trend + (volume spike AND retest)
-    decision = cond_trend and cond_vol and retest
+
+    # Volume spike
+    vol_mean = df["volume"].iloc[-7:-1].mean() if len(df) >= 8 else df["volume"].mean()
+    last_vol = df["volume"].iloc[-1]
+    cond_vol = last_vol > (VOLUME_MULT * vol_mean if vol_mean>0 else VOLUME_MULT * df["volume"].mean())
+
+    # Retest closeness of price to EMA zone (tight retest)
+    retest = abs(last_close - ema_zone) / ema_zone < 0.006
+
+    # Orderbook sweep detection
+    try:
+        sweep, sweep_info = detect_orderbook_sweep(symbol)
+    except Exception as e:
+        sweep, sweep_info = False, {"error": str(e)}
+
+    # Compute confidence score
+    score = 0
+    score += 1 if cond_trend else 0
+    score += 1 if cond_vol else 0
+    score += 1 if sweep else 0
+
     info = {
         "cond_trend": bool(cond_trend),
         "cond_vol": float(last_vol),
@@ -62,8 +137,19 @@ def check_conditions(df):
         "retest": bool(retest),
         "ema_fast": float(df["ema_fast"].iloc[-1]),
         "ema_slow": float(df["ema_slow"].iloc[-1]),
-        "last_close": float(last_close)
+        "last_close": float(last_close),
+        "sweep_info": sweep_info,
+        "confidence_score": int(score)
     }
+
+    # Final decision: whitelist + liquidity + spread + (score>=2) + retest + trend OR volume present.
+    ok_pair = (symbol in PAIR_WHITELIST)
+    ok_liq, liq_info = liquidity_ok(symbol)
+    ok_spread, spread_info = spread_ok(symbol)
+
+    info.update({"ok_pair": ok_pair, "liquidity": liq_info, "spread": spread_info})
+    decision = ok_pair and ok_liq and ok_spread and (score >= 2) and retest
+
     return decision, info
 
 def send_telegram(text):
@@ -81,18 +167,22 @@ def send_telegram(text):
         return False
 
 def main():
+    symbol = PAIR
     try:
-        df = fetch_klines(PAIR, INTERVAL, CANDLE_LIMIT)
+        df = fetch_klines(symbol, INTERVAL, CANDLE_LIMIT)
     except Exception as e:
-        print("Kline fetch failed:", e)
-        return
-    decision, info = check_conditions(df)
+        print("Kline fetch failed:", e); return
+
+    decision, info = check_conditions(df, symbol)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     if decision:
-        text = (f"✅ Checklist met for <b>{PAIR}</b> ({INTERVAL})\n"
+        text = (f"✅ <b>HIGH CONFIDENCE</b> checklist met for <b>{symbol}</b> ({INTERVAL})\n"
                 f"Price: {info['last_close']:.6f}\n"
                 f"EMA{EMA_FAST}: {info['ema_fast']:.6f} | EMA{EMA_SLOW}: {info['ema_slow']:.6f}\n"
+                f"Confidence score: {info['confidence_score']}/3\n"
                 f"Volume: {info['cond_vol']:.2f} (avg {info['vol_mean']:.2f})\n"
+                f"Orderbook sweep: {info['sweep_info']}\n"
+                f"Spread: {info['spread']}\n"
                 f"Time: {now}\n\nAction: Manual review & trade.")
         ok = send_telegram(text)
         print("Alert sent:", ok)
